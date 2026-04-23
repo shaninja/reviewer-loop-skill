@@ -1,0 +1,34 @@
+[
+  {
+    "name": "correctness",
+    "focus": "semantic correctness, realistic edge cases, test adequacy, regressions, and parity with nearby code patterns where those patterns affect correctness",
+    "constraints": [
+      "Do not ask for redesigns unless required for correctness.",
+      "Treat pre-existing limitations as out of scope unless the patch makes them worse."
+    ]
+  },
+  {
+    "name": "maintainability",
+    "focus": "local consistency, future extension cost, duplication drift risk, naming, comments, and fit with the repository's existing patterns",
+    "constraints": [
+      "Prefer local consistency over idealized design.",
+      "Do not push broad refactors unless the patch creates a real maintenance risk."
+    ]
+  },
+  {
+    "name": "scope-and-regression",
+    "focus": "whether the patch is narrowly scoped, avoids unintended behavior changes, and does not introduce unnecessary coupling",
+    "constraints": [
+      "Be strict about scope creep.",
+      "Do not ask for unrelated improvements."
+    ]
+  },
+  {
+    "name": "edge-cases",
+    "focus": "boundary conditions, empty and singleton inputs, configuration or environment edge cases, state transitions, and happy-path-only tests",
+    "constraints": [
+      "Focus on realistic edge cases for the specific patch.",
+      "Do not ask for speculative hardening unless there is concrete risk."
+    ]
+  }
+]

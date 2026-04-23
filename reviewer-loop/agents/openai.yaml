@@ -1,0 +1,7 @@
+interface:
+  display_name: "Reviewer Loop"
+  short_description: "Run a multi-agent review/fix loop"
+  default_prompt: "Use $reviewer-loop to run a multi-agent review/fix loop on my current repo changes."
+
+policy:
+  allow_implicit_invocation: true

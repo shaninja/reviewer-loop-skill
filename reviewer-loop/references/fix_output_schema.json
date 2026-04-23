@@ -1,0 +1,32 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "status",
+    "summary",
+    "notes",
+    "blocking_reason"
+  ],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": [
+        "fixed",
+        "blocked",
+        "failed"
+      ]
+    },
+    "summary": {
+      "type": "string"
+    },
+    "notes": {
+      "type": "string"
+    },
+    "blocking_reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}
