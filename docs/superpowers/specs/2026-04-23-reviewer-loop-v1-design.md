@@ -46,6 +46,7 @@ The Python controller provides:
 - mandatory test gating
 - bounded retries and escalation
 - durable run artifacts
+- inline prompt embedding for diff snapshots, merged findings, and repo guidance using escaped sentinel blocks, with explicit inline-size budgets that fail closed instead of truncating
 
 ## Scope Policy
 

@@ -5,7 +5,8 @@
     "status",
     "summary",
     "notes",
-    "blocking_reason"
+    "blocking_reason",
+    "edits"
   ],
   "properties": {
     "status": {
@@ -27,6 +28,36 @@
         "string",
         "null"
       ]
+    },
+    "edits": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "path",
+          "action",
+          "expected_old_text",
+          "new_text"
+        ],
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "replace"
+            ]
+          },
+          "expected_old_text": {
+            "type": "string"
+          },
+          "new_text": {
+            "type": "string"
+          }
+        }
+      }
     }
   }
 }

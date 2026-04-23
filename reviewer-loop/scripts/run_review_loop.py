@@ -12,16 +12,18 @@ from reviewer_loop_lib import (
     REVIEW_OUTPUT_SCHEMA_PATH,
     LoopError,
     all_tests_passed,
+    build_fixer_file_context,
     build_fixer_prompt,
     build_reviewer_prompt,
     build_run_record,
     create_run_dir,
     dedupe_findings,
     ensure_git_repo,
+    load_json_schema,
     load_repo_review_guidance,
     load_reviewer_roles,
     resolve_scope,
-    run_codex_exec,
+    run_app_server_turn,
     run_required_tests,
     summarize_test_failures,
     validate_test_commands,
@@ -31,7 +33,14 @@ from reviewer_loop_lib import (
 )
 
 
-def parse_args() -> argparse.Namespace:
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be > 0")
+    return parsed
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the reviewer loop against a target repo.")
     parser.add_argument("--repo", required=True, help="Target Git repository path.")
     parser.add_argument(
@@ -42,17 +51,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--commit-count", type=int, default=None)
     parser.add_argument("--base-ref", default=None)
     parser.add_argument("--test-command", action="append", default=[], dest="test_commands")
-    parser.add_argument("--max-review-rounds", type=int, default=7)
+    parser.add_argument("--max-review-rounds", type=int, default=5)
     parser.add_argument("--max-test-fix-attempts", type=int, default=3)
+    parser.add_argument("--codex-timeout-seconds", type=positive_int, default=None)
     parser.add_argument("--reviewer-model", default=None)
     parser.add_argument("--fixer-model", default=None)
     parser.add_argument("--dangerously-bypass-codex-sandbox", action="store_true")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content)
+
+
+def apply_fixer_edits(repo: Path, payload: dict[str, object]) -> None:
+    repo_root = repo.resolve()
+    for raw_edit in payload.get("edits", []):
+        edit = dict(raw_edit)
+        if edit.get("action") != "replace":
+            raise LoopError(f"Unsupported fixer edit action: {edit.get('action')}")
+
+        relative_path = str(edit["path"])
+        target = (repo / relative_path).resolve()
+        try:
+            target.relative_to(repo_root)
+        except ValueError as error:
+            raise LoopError(f"Fixer edit path escapes the repository: {relative_path}") from error
+        if not target.exists():
+            raise LoopError(f"Fixer edit path does not exist: {relative_path}")
+
+        current = target.read_text()
+        expected_old_text = str(edit["expected_old_text"])
+        if expected_old_text not in current:
+            raise LoopError(f"{relative_path} did not contain the expected text for replacement.")
+        updated = current.replace(expected_old_text, str(edit["new_text"]), 1)
+        target.write_text(updated)
 
 
 def run_parallel_reviewers(
@@ -64,6 +98,7 @@ def run_parallel_reviewers(
     reviewer_model: str | None,
     review_round_dir: Path,
     bypass_codex_sandbox: bool,
+    codex_timeout_seconds: int | None,
 ) -> list[dict[str, object]]:
     payloads: list[dict[str, object]] = []
 
@@ -78,17 +113,18 @@ def run_parallel_reviewers(
 
         prompt = build_reviewer_prompt(role, scope, diff_path, repo_guidance_path)
         write_text(prompt_path, prompt)
-        completed, payload = run_codex_exec(
+        artifacts = run_app_server_turn(
             repo,
             prompt,
-            output_schema=REVIEW_OUTPUT_SCHEMA_PATH,
-            output_file=output_path,
+            output_schema=load_json_schema(REVIEW_OUTPUT_SCHEMA_PATH),
             sandbox_mode="read-only",
             model=reviewer_model,
-            bypass_codex_sandbox=bypass_codex_sandbox,
+            timeout_seconds=codex_timeout_seconds,
         )
-        write_text(stdout_path, completed.stdout)
-        write_text(stderr_path, completed.stderr)
+        payload = artifacts.payload
+        write_json(output_path, payload)
+        write_text(stdout_path, artifacts.stdout_log)
+        write_text(stderr_path, artifacts.stderr_log)
         payload["reviewer"] = role_name
         return payload
 
@@ -109,16 +145,19 @@ def run_fixer(
     fixer_model: str | None,
     output_dir: Path,
     bypass_codex_sandbox: bool,
+    codex_timeout_seconds: int | None,
     *,
     phase: str,
     test_failure_summary: str | None = None,
 ) -> dict[str, object]:
     output_dir.mkdir(parents=True, exist_ok=True)
+    file_context_path = build_fixer_file_context(repo, findings_path, output_dir / "file-context.md")
     prompt = build_fixer_prompt(
         scope,
         findings_path,
         repo_guidance_path,
         test_commands,
+        file_context_path,
         phase=phase,
         test_failure_summary=test_failure_summary,
     )
@@ -127,18 +166,29 @@ def run_fixer(
     stdout_path = output_dir / "stdout.log"
     stderr_path = output_dir / "stderr.log"
     write_text(prompt_path, prompt)
-    completed, payload = run_codex_exec(
+    artifacts = run_app_server_turn(
         repo,
         prompt,
-        output_schema=FIX_OUTPUT_SCHEMA_PATH,
-        output_file=output_path,
-        sandbox_mode="workspace-write",
+        output_schema=load_json_schema(FIX_OUTPUT_SCHEMA_PATH),
+        sandbox_mode="read-only",
         model=fixer_model,
-        bypass_codex_sandbox=bypass_codex_sandbox,
+        timeout_seconds=codex_timeout_seconds,
     )
-    write_text(stdout_path, completed.stdout)
-    write_text(stderr_path, completed.stderr)
+    payload = artifacts.payload
+    write_json(output_path, payload)
+    write_text(stdout_path, artifacts.stdout_log)
+    write_text(stderr_path, artifacts.stderr_log)
     return payload
+
+
+def ensure_fixer_succeeded(payload: dict[str, object]) -> None:
+    status = payload.get("status")
+    if status == "fixed":
+        return
+    reason = str(payload.get("blocking_reason") or payload.get("summary") or "Fixer did not complete successfully.")
+    if status == "blocked":
+        raise LoopError(reason)
+    raise LoopError(f"Fixer failed: {reason}")
 
 
 def main() -> int:
@@ -201,7 +251,7 @@ def main() -> int:
                 raise LoopError("Initial required tests did not pass before the review loop started.")
 
             failure_summary = summarize_test_failures(bootstrap_results)
-            run_fixer(
+            fix_payload = run_fixer(
                 repo,
                 scope,
                 bootstrap_findings_path,
@@ -210,9 +260,12 @@ def main() -> int:
                 args.fixer_model,
                 run_dir / "artifacts" / "bootstrap" / f"attempt-{bootstrap_attempt}",
                 args.dangerously_bypass_codex_sandbox,
+                args.codex_timeout_seconds,
                 phase="bootstrap-test-recovery",
                 test_failure_summary=failure_summary,
             )
+            ensure_fixer_succeeded(fix_payload)
+            apply_fixer_edits(repo, fix_payload)
             bootstrap_results = run_required_tests(
                 repo,
                 args.test_commands,
@@ -243,6 +296,7 @@ def main() -> int:
                 args.reviewer_model,
                 review_round_dir,
                 args.dangerously_bypass_codex_sandbox,
+                args.codex_timeout_seconds,
             )
 
             blocked_reasons = [
@@ -283,7 +337,7 @@ def main() -> int:
                     raise LoopError("Fix attempts hit the required-test retry cap.")
 
                 fix_dir = run_dir / "artifacts" / "fixes" / f"round-{review_round}" / f"attempt-{test_fix_attempt}"
-                run_fixer(
+                fix_payload = run_fixer(
                     repo,
                     scope,
                     merged_findings_path,
@@ -292,9 +346,12 @@ def main() -> int:
                     args.fixer_model,
                     fix_dir,
                     args.dangerously_bypass_codex_sandbox,
+                    args.codex_timeout_seconds,
                     phase="review-remediation" if test_fix_attempt == 1 else "test-recovery",
                     test_failure_summary=summarize_test_failures(test_results) if test_results else None,
                 )
+                ensure_fixer_succeeded(fix_payload)
+                apply_fixer_edits(repo, fix_payload)
 
                 test_dir = run_dir / "artifacts" / "tests" / f"round-{review_round}" / f"attempt-{test_fix_attempt}"
                 test_results = run_required_tests(repo, args.test_commands, test_dir)

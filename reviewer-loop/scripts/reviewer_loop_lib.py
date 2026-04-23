@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import queue
 import re
 import subprocess
+import threading
+import time
 import textwrap
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -16,6 +19,12 @@ REVIEW_OUTPUT_SCHEMA_PATH = SKILL_ROOT / "references" / "review_output_schema.js
 FIX_OUTPUT_SCHEMA_PATH = SKILL_ROOT / "references" / "fix_output_schema.json"
 SEVERITY_ORDER = {"blocker": 4, "high": 3, "medium": 2, "low": 1, "nit": 0}
 INTERNAL_RUNS_PREFIX = ".codex/reviewer-loop-runs/"
+INLINE_DIFF_PROMPT_MAX_CHARS = 120000
+INLINE_FINDINGS_PROMPT_MAX_CHARS = 80000
+INLINE_GUIDANCE_PROMPT_MAX_CHARS = 30000
+INLINE_FILE_CONTEXT_PROMPT_MAX_CHARS = 80000
+APP_SERVER_CLIENT_NAME = "reviewer-loop"
+APP_SERVER_CLIENT_VERSION = "0.1.0"
 
 
 class LoopError(RuntimeError):
@@ -42,6 +51,13 @@ class ReviewFinding:
     line: int | None
     must_fix: bool
     reviewers: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ExecutionArtifacts:
+    payload: dict[str, Any]
+    stdout_log: str
+    stderr_log: str
 
 
 def git(repo: Path, *args: str, check: bool = True) -> str:
@@ -198,8 +214,8 @@ def write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
-def read_json_payload(path: Path) -> Any:
-    raw = path.read_text().strip()
+def parse_json_payload(raw: str) -> Any:
+    raw = raw.strip()
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
@@ -213,17 +229,99 @@ def read_json_payload(path: Path) -> Any:
     if object_match:
         return json.loads(object_match.group(1))
 
-    raise LoopError(f"Could not parse JSON payload from {path}")
+    raise LoopError("Could not parse JSON payload.")
 
 
-def safe_read_text(path: Path, *, max_chars: int = 20000) -> str:
+def read_json_payload(path: Path) -> Any:
+    try:
+        return parse_json_payload(path.read_text())
+    except LoopError as error:
+        raise LoopError(f"Could not parse JSON payload from {path}") from error
+
+
+def safe_read_text(path: Path, *, max_chars: int | None = 20000) -> str:
     try:
         text = path.read_text()
     except UnicodeDecodeError:
         return "<binary or non-text file omitted>"
-    if len(text) > max_chars:
+    if max_chars is not None and len(text) > max_chars:
         return text[:max_chars] + "\n...<truncated>..."
     return text
+
+
+def read_embedded_context(path: Path, *, label: str, max_chars: int) -> str:
+    content = safe_read_text(path, max_chars=None)
+    if len(content) > max_chars:
+        raise LoopError(
+            f"{label} is {len(content)} characters, which exceeds the inline prompt budget of {max_chars}. "
+            "Narrow the review scope or split the run into smaller slices."
+        )
+    return content
+
+
+def render_embedded_block(label: str, content: str) -> str:
+    start_marker = f"<<<REVIEWER_LOOP_BEGIN {label}>>>"
+    end_marker = f"<<<REVIEWER_LOOP_END {label}>>>"
+    escaped_content = content.replace(start_marker, f"\\{start_marker}").replace(end_marker, f"\\{end_marker}")
+    return "\n".join(
+        [
+            start_marker,
+            escaped_content,
+            end_marker,
+        ]
+    )
+
+
+def load_json_schema(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text())
+    if not isinstance(payload, dict):
+        raise LoopError(f"Schema at {path} must be a JSON object.")
+    return payload
+
+
+def build_thread_start_request(
+    *,
+    cwd: Path,
+    sandbox: str,
+    model: str | None,
+) -> dict[str, Any]:
+    params: dict[str, Any] = {
+        "cwd": str(cwd),
+        "approvalPolicy": "never",
+        "sandbox": sandbox,
+        "personality": "pragmatic",
+        "developerInstructions": (
+            "Use the prompt as the primary source of truth. "
+            "Do not call MCP discovery tools unless the prompt explicitly requires them."
+        ),
+    }
+    if model:
+        params["model"] = model
+    return {
+        "method": "thread/start",
+        "params": params,
+    }
+
+
+def build_turn_start_request(
+    *,
+    thread_id: str,
+    prompt: str,
+    output_schema: dict[str, Any],
+    model: str | None,
+) -> dict[str, Any]:
+    params: dict[str, Any] = {
+        "threadId": thread_id,
+        "input": [{"type": "text", "text": prompt}],
+        "outputSchema": output_schema,
+        "approvalPolicy": "never",
+    }
+    if model:
+        params["model"] = model
+    return {
+        "method": "turn/start",
+        "params": params,
+    }
 
 
 def is_internal_artifact_path(path: str) -> bool:
@@ -304,8 +402,14 @@ def build_reviewer_prompt(
     diff_path: Path,
     repo_guidance_path: Path | None,
 ) -> str:
+    diff_snapshot = read_embedded_context(
+        diff_path,
+        label="DIFF SNAPSHOT",
+        max_chars=INLINE_DIFF_PROMPT_MAX_CHARS,
+    )
     guidance_block = (
-        f"Repo-specific review guidance is in `{repo_guidance_path}`. Read it and follow it.\n"
+        "Repo-specific review guidance is included below. Follow it.\n\n"
+        f"{render_embedded_block('REPO GUIDANCE', read_embedded_context(repo_guidance_path, label='REPO GUIDANCE', max_chars=INLINE_GUIDANCE_PROMPT_MAX_CHARS))}\n"
         if repo_guidance_path
         else "No repo-specific review guidance was found.\n"
     )
@@ -325,7 +429,11 @@ def build_reviewer_prompt(
         - Baseline: {scope.baseline_sha}
         - Description: {scope.description}
 
-        The diff snapshot for this round is in `{diff_path}`.
+        All review context you need is embedded below. Do not rely on local file reads or shell commands unless they are absolutely necessary to understand a concrete finding.
+
+        Diff snapshot:
+        {render_embedded_block('DIFF SNAPSHOT', diff_snapshot)}
+
         {guidance_block}
         Review only the requested change set. Do not ask for unrelated improvements.
         Prefer concrete, file-specific findings. Use severities `nit`, `low`, `medium`, `high`, or `blocker`.
@@ -336,19 +444,73 @@ def build_reviewer_prompt(
     ).strip()
 
 
+def build_fixer_file_context(repo: Path, findings_path: Path, output_path: Path) -> Path | None:
+    findings_payload = read_json_payload(findings_path)
+    targets = sorted(
+        {
+            str(item["file"])
+            for item in findings_payload.get("findings", [])
+            if item.get("file")
+        }
+    )
+    if not targets:
+        return None
+
+    parts = ["# Reviewer Loop Fixer File Context"]
+    for relative_name in targets:
+        file_path = repo / relative_name
+        if not file_path.exists() or not file_path.is_file():
+            continue
+        parts.extend(
+            [
+                "",
+                f"## {relative_name}",
+                "",
+                "```text",
+                safe_read_text(file_path, max_chars=None),
+                "```",
+            ]
+        )
+
+    content = "\n".join(parts).strip()
+    if content == "# Reviewer Loop Fixer File Context":
+        return None
+    if len(content) > INLINE_FILE_CONTEXT_PROMPT_MAX_CHARS:
+        raise LoopError(
+            f"FILE CONTEXT is {len(content)} characters, which exceeds the inline prompt budget of "
+            f"{INLINE_FILE_CONTEXT_PROMPT_MAX_CHARS}. Narrow the review scope or fix findings in smaller slices."
+        )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(content + "\n")
+    return output_path
+
+
 def build_fixer_prompt(
     scope: ScopeResolution,
     findings_path: Path,
     repo_guidance_path: Path | None,
     test_commands: list[str],
+    file_context_path: Path | None = None,
     *,
     phase: str,
     test_failure_summary: str | None = None,
 ) -> str:
+    findings_block = read_embedded_context(
+        findings_path,
+        label="AGGREGATED FINDINGS",
+        max_chars=INLINE_FINDINGS_PROMPT_MAX_CHARS,
+    )
     guidance_block = (
-        f"Repo-specific review guidance is in `{repo_guidance_path}`. Read it and follow it.\n"
+        "Repo-specific review guidance is included below. Follow it.\n\n"
+        f"{render_embedded_block('REPO GUIDANCE', read_embedded_context(repo_guidance_path, label='REPO GUIDANCE', max_chars=INLINE_GUIDANCE_PROMPT_MAX_CHARS))}\n"
         if repo_guidance_path
         else "No repo-specific review guidance was found.\n"
+    )
+    file_context_block = (
+        "Relevant current file contents are embedded below.\n\n"
+        f"{render_embedded_block('FILE CONTEXT', read_embedded_context(file_context_path, label='FILE CONTEXT', max_chars=INLINE_FILE_CONTEXT_PROMPT_MAX_CHARS))}\n"
+        if file_context_path
+        else "No file context was embedded for this fixer turn.\n"
     )
     tests_block = "\n".join(f"- {command}" for command in test_commands)
     failure_block = (
@@ -367,13 +529,26 @@ def build_fixer_prompt(
         - Description: {scope.description}
 
         Fix phase: {phase}
-        Aggregated findings are in `{findings_path}`.
+        Do not rely on local file reads or shell commands for review context. The aggregated findings and repo guidance are embedded below.
+
+        Aggregated findings:
+        {render_embedded_block('AGGREGATED FINDINGS', findings_block)}
+
         {guidance_block}
+        {file_context_block}
         Required test commands that the controller will rerun after you finish:
         {tests_block}
         {failure_block}
         Do not commit, stash, reset, or create a new worktree.
         Keep changes tightly scoped to the findings and required test fixes.
+        Do not modify files directly in this turn.
+        Return exact replacement edits only in the `edits` array.
+        Each edit must use:
+        - a repo-relative `path`
+        - action `replace`
+        - exact current `expected_old_text`
+        - exact replacement `new_text`
+        If you cannot produce safe exact replacements, return `status: "blocked"` with a clear `blocking_reason`.
 
         Return JSON only. Do not wrap it in Markdown fences.
         """
@@ -419,6 +594,7 @@ def run_codex_exec(
     sandbox_mode: str,
     model: str | None = None,
     bypass_codex_sandbox: bool = False,
+    timeout_seconds: int | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], Any]:
     command = build_codex_exec_command(
         repo,
@@ -429,16 +605,254 @@ def run_codex_exec(
         bypass_codex_sandbox=bypass_codex_sandbox,
     )
 
-    result = subprocess.run(
-        command,
-        input=prompt,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            command,
+            input=prompt,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise LoopError(f"codex exec timed out after {timeout_seconds}s") from error
+
     if result.returncode != 0:
-        raise LoopError(result.stderr.strip() or result.stdout.strip() or "codex exec failed")
+        message = result.stderr.strip() or result.stdout.strip() or "codex exec failed"
+        raise LoopError(message)
+
     return result, read_json_payload(output_file)
+
+
+def _format_line_log(lines: list[str]) -> str:
+    if not lines:
+        return ""
+    return "\n".join(lines) + "\n"
+
+
+def _pipe_reader(
+    stream,
+    lines: list[str],
+    *,
+    message_queue: queue.Queue[str | None] | None = None,
+) -> None:
+    try:
+        for line in stream:
+            stripped = line.rstrip("\n")
+            lines.append(stripped)
+            if message_queue is not None:
+                message_queue.put(stripped)
+    finally:
+        if message_queue is not None:
+            message_queue.put(None)
+
+
+def _is_server_request(message: dict[str, Any]) -> bool:
+    return "id" in message and "method" in message and "result" not in message and "error" not in message
+
+
+def _send_json_rpc_request(stdin, request_id: int, payload: dict[str, Any]) -> None:
+    message = {"id": request_id, **payload}
+    stdin.write(json.dumps(message) + "\n")
+    stdin.flush()
+
+
+def _send_json_rpc_error(stdin, request_id: Any, message: str) -> None:
+    stdin.write(
+        json.dumps(
+            {
+                "id": request_id,
+                "error": {
+                    "code": -32000,
+                    "message": message,
+                },
+            }
+        )
+        + "\n"
+    )
+    stdin.flush()
+
+
+def run_app_server_turn(
+    repo: Path,
+    prompt: str,
+    *,
+    output_schema: dict[str, Any],
+    sandbox_mode: str,
+    model: str | None = None,
+    timeout_seconds: int | None = None,
+) -> ExecutionArtifacts:
+    process = subprocess.Popen(
+        ["codex", "app-server", "--listen", "stdio://"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    assert process.stdin is not None
+    assert process.stdout is not None
+    assert process.stderr is not None
+
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    stdout_queue: queue.Queue[str | None] = queue.Queue()
+
+    stdout_thread = threading.Thread(
+        target=_pipe_reader,
+        args=(process.stdout, stdout_lines),
+        kwargs={"message_queue": stdout_queue},
+        daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=_pipe_reader,
+        args=(process.stderr, stderr_lines),
+        daemon=True,
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+
+    def next_message() -> dict[str, Any]:
+        if timeout_seconds is None:
+            line = stdout_queue.get()
+        else:
+            remaining = timeout_seconds - (time.monotonic() - start_time)
+            if remaining <= 0:
+                raise LoopError(f"codex app-server turn timed out after {timeout_seconds}s")
+            line = stdout_queue.get(timeout=remaining)
+        if line is None:
+            raise LoopError("codex app-server closed stdout before the turn completed")
+        try:
+            return json.loads(line)
+        except json.JSONDecodeError as error:
+            raise LoopError(f"codex app-server emitted invalid JSON: {line}") from error
+
+    start_time = time.monotonic()
+
+    try:
+        _send_json_rpc_request(
+            process.stdin,
+            1,
+            {
+                "method": "initialize",
+                "params": {
+                    "clientInfo": {
+                        "name": APP_SERVER_CLIENT_NAME,
+                        "version": APP_SERVER_CLIENT_VERSION,
+                    },
+                    "capabilities": {},
+                },
+            },
+        )
+
+        initialized = False
+        while not initialized:
+            message = next_message()
+            if _is_server_request(message):
+                _send_json_rpc_error(
+                    process.stdin,
+                    message["id"],
+                    "reviewer-loop app-server client does not support interactive server requests",
+                )
+                continue
+            if message.get("id") == 1:
+                if "error" in message:
+                    raise LoopError(f"codex app-server initialize failed: {message['error']}")
+                initialized = True
+
+        _send_json_rpc_request(
+            process.stdin,
+            2,
+            build_thread_start_request(
+                cwd=repo,
+                sandbox=sandbox_mode,
+                model=model,
+            ),
+        )
+
+        thread_id: str | None = None
+        while thread_id is None:
+            message = next_message()
+            if _is_server_request(message):
+                _send_json_rpc_error(
+                    process.stdin,
+                    message["id"],
+                    "reviewer-loop app-server client does not support interactive server requests",
+                )
+                continue
+            if message.get("id") == 2:
+                if "error" in message:
+                    raise LoopError(f"codex app-server thread/start failed: {message['error']}")
+                thread_id = str(message["result"]["thread"]["id"])
+
+        _send_json_rpc_request(
+            process.stdin,
+            3,
+            build_turn_start_request(
+                thread_id=thread_id,
+                prompt=prompt,
+                output_schema=output_schema,
+                model=model,
+            ),
+        )
+
+        deltas: dict[str, list[str]] = {}
+        final_text: str | None = None
+        while True:
+            message = next_message()
+            if _is_server_request(message):
+                _send_json_rpc_error(
+                    process.stdin,
+                    message["id"],
+                    "reviewer-loop app-server client does not support interactive server requests",
+                )
+                continue
+            if message.get("id") == 3 and "error" in message:
+                raise LoopError(f"codex app-server turn/start failed: {message['error']}")
+
+            method = message.get("method")
+            params = message.get("params", {})
+            if method == "item/agentMessage/delta":
+                deltas.setdefault(str(params["itemId"]), []).append(str(params["delta"]))
+                continue
+            if method == "item/completed":
+                item = params.get("item", {})
+                if item.get("type") == "agentMessage":
+                    item_id = str(item.get("id"))
+                    item_text = str(item.get("text") or "".join(deltas.get(item_id, [])))
+                    if item.get("phase") == "final_answer" or final_text is None:
+                        final_text = item_text
+                continue
+            if method == "turn/completed":
+                turn = params.get("turn", {})
+                if turn.get("status") != "completed":
+                    raise LoopError(f"codex app-server turn failed: {turn}")
+                break
+
+        if final_text is None:
+            raise LoopError("codex app-server completed the turn without a final assistant message")
+        payload = parse_json_payload(final_text)
+        if not isinstance(payload, dict):
+            raise LoopError("codex app-server final payload must be a JSON object")
+        return ExecutionArtifacts(
+            payload=payload,
+            stdout_log=_format_line_log(stdout_lines),
+            stderr_log=_format_line_log(stderr_lines),
+        )
+    except queue.Empty as error:
+        raise LoopError(f"codex app-server turn timed out after {timeout_seconds}s") from error
+    finally:
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+        stdout_thread.join(timeout=1)
+        stderr_thread.join(timeout=1)
 
 
 def summarize_test_failures(results: list[dict[str, Any]]) -> str:
