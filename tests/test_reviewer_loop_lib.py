@@ -16,6 +16,7 @@ from reviewer_loop_lib import (
     LoopError,
     FIX_OUTPUT_SCHEMA_PATH,
     REVIEW_OUTPUT_SCHEMA_PATH,
+    build_app_server_command,
     build_fixer_prompt,
     build_thread_start_request,
     build_turn_start_request,
@@ -207,6 +208,21 @@ class ReviewerLoopLibTests(unittest.TestCase):
         self.assertEqual(request["params"]["sandbox"], "read-only")
         self.assertEqual(request["params"]["approvalPolicy"], "never")
         self.assertEqual(request["params"]["model"], "gpt-5.4")
+
+    def test_build_app_server_command_pins_medium_reasoning_effort(self) -> None:
+        command = build_app_server_command()
+
+        self.assertEqual(
+            command,
+            [
+                "codex",
+                "app-server",
+                "-c",
+                'model_reasoning_effort="medium"',
+                "--listen",
+                "stdio://",
+            ],
+        )
 
     def test_build_turn_start_request_includes_output_schema_and_prompt(self) -> None:
         request = build_turn_start_request(

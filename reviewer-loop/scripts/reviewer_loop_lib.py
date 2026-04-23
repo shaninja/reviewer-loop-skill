@@ -25,6 +25,7 @@ INLINE_GUIDANCE_PROMPT_MAX_CHARS = 30000
 INLINE_FILE_CONTEXT_PROMPT_MAX_CHARS = 80000
 APP_SERVER_CLIENT_NAME = "reviewer-loop"
 APP_SERVER_CLIENT_VERSION = "0.1.0"
+APP_SERVER_REASONING_EFFORT = "medium"
 
 
 class LoopError(RuntimeError):
@@ -322,6 +323,17 @@ def build_turn_start_request(
         "method": "turn/start",
         "params": params,
     }
+
+
+def build_app_server_command() -> list[str]:
+    return [
+        "codex",
+        "app-server",
+        "-c",
+        f'model_reasoning_effort="{APP_SERVER_REASONING_EFFORT}"',
+        "--listen",
+        "stdio://",
+    ]
 
 
 def is_internal_artifact_path(path: str) -> bool:
@@ -683,7 +695,7 @@ def run_app_server_turn(
     timeout_seconds: int | None = None,
 ) -> ExecutionArtifacts:
     process = subprocess.Popen(
-        ["codex", "app-server", "--listen", "stdio://"],
+        build_app_server_command(),
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
