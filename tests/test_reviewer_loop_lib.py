@@ -18,6 +18,7 @@ from reviewer_loop_lib import (
     REVIEW_OUTPUT_SCHEMA_PATH,
     build_app_server_command,
     build_fixer_prompt,
+    build_manager_closeout,
     build_thread_start_request,
     build_turn_start_request,
     build_codex_exec_command,
@@ -223,6 +224,59 @@ class ReviewerLoopLibTests(unittest.TestCase):
                 "stdio://",
             ],
         )
+
+    def test_build_manager_closeout_explains_issues_fixes_and_test_evidence(self) -> None:
+        repo = self.make_repo()
+        scope = resolve_scope(repo, "last-commit")
+
+        closeout = build_manager_closeout(
+            scope,
+            verdict="approved",
+            round_records=[
+                {
+                    "round": 1,
+                    "verdict": "changes_requested",
+                    "findings": [
+                        {
+                            "title": "Generator accepts the wrong Docker version",
+                            "detail": (
+                                "The manifest generator reads help from whichever docker binary "
+                                "is first on PATH, so a local Docker version can silently produce "
+                                "a manifest for a different target."
+                            ),
+                            "file": "tools/dump_docker_option_manifest.py",
+                            "line": 158,
+                            "severity": "medium",
+                            "category": "regression",
+                        }
+                    ],
+                    "fixes": [
+                        {
+                            "summary": "Added Docker client validation before help parsing.",
+                            "notes": (
+                                "The generator now checks client Version and ApiVersion against "
+                                "spec/current-target.json."
+                            ),
+                        }
+                    ],
+                    "test_results": [
+                        {
+                            "command": "python3 -m pytest -q",
+                            "returncode": 0,
+                        }
+                    ],
+                }
+            ],
+        )
+
+        self.assertIn("## Issues And Fixes", closeout)
+        self.assertIn("Generator accepts the wrong Docker version", closeout)
+        self.assertIn("Why this was an issue", closeout)
+        self.assertIn("silently produce a manifest for a different target", closeout)
+        self.assertIn("How it was fixed", closeout)
+        self.assertIn("Added Docker client validation before help parsing", closeout)
+        self.assertIn("Test evidence", closeout)
+        self.assertIn("python3 -m pytest -q: passed", closeout)
 
     def test_build_turn_start_request_includes_output_schema_and_prompt(self) -> None:
         request = build_turn_start_request(

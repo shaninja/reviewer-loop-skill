@@ -14,6 +14,7 @@ from reviewer_loop_lib import (
     all_tests_passed,
     build_fixer_file_context,
     build_fixer_prompt,
+    build_manager_closeout,
     build_reviewer_prompt,
     build_run_record,
     create_run_dir,
@@ -191,6 +192,19 @@ def ensure_fixer_succeeded(payload: dict[str, object]) -> None:
     raise LoopError(f"Fixer failed: {reason}")
 
 
+def write_manager_closeout(run_dir: Path, scope, verdict: str, round_records: list[dict[str, object]]) -> Path:
+    closeout_path = run_dir / "manager-closeout.md"
+    write_text(
+        closeout_path,
+        build_manager_closeout(
+            scope,
+            verdict=verdict,
+            round_records=round_records,
+        ),
+    )
+    return closeout_path
+
+
 def main() -> int:
     args = parse_args()
     repo = Path(args.repo).resolve()
@@ -277,6 +291,7 @@ def main() -> int:
             )
 
         roles = load_reviewer_roles()
+        round_records: list[dict[str, object]] = []
         for review_round in range(1, args.max_review_rounds + 1):
             run_record["review_round"] = review_round
             write_json(run_dir / "run.json", run_record)
@@ -318,12 +333,28 @@ def main() -> int:
             merged_findings_path = review_round_dir / "merged-findings.json"
             write_json(merged_findings_path, merged_payload)
 
+            round_record: dict[str, object] = {
+                "round": review_round,
+                "verdict": verdict,
+                "findings": merged_payload["findings"],
+                "fixes": [],
+                "test_results": [],
+            }
+            round_records.append(round_record)
+
             if verdict in {"approved", "approved_with_notes"}:
+                closeout_path = write_manager_closeout(run_dir, scope, verdict, round_records)
                 run_record["status"] = "completed"
                 run_record["verdict"] = verdict
                 run_record["findings"] = len(findings)
+                run_record["manager_closeout"] = str(closeout_path)
                 write_json(run_dir / "run.json", run_record)
-                print(json.dumps({"status": "completed", "verdict": verdict, "run_dir": str(run_dir)}))
+                print(json.dumps({
+                    "status": "completed",
+                    "verdict": verdict,
+                    "run_dir": str(run_dir),
+                    "manager_closeout": str(closeout_path),
+                }))
                 return 0
 
             if verdict == "blocked":
@@ -352,9 +383,11 @@ def main() -> int:
                 )
                 ensure_fixer_succeeded(fix_payload)
                 apply_fixer_edits(repo, fix_payload)
+                round_record["fixes"].append(fix_payload)
 
                 test_dir = run_dir / "artifacts" / "tests" / f"round-{review_round}" / f"attempt-{test_fix_attempt}"
                 test_results = run_required_tests(repo, args.test_commands, test_dir)
+                round_record["test_results"].extend(test_results)
                 write_json(test_dir / "results.json", test_results)
                 if all_tests_passed(test_results):
                     break
@@ -364,8 +397,14 @@ def main() -> int:
         if "run_dir" in locals():
             run_record["status"] = "escalated"
             run_record["error"] = str(error)
+            if "scope" in locals() and "round_records" in locals():
+                closeout_path = write_manager_closeout(run_dir, scope, "escalated", round_records)
+                run_record["manager_closeout"] = str(closeout_path)
             write_json(run_dir / "run.json", run_record)
-            print(json.dumps({"status": "escalated", "error": str(error), "run_dir": str(run_dir)}))
+            payload = {"status": "escalated", "error": str(error), "run_dir": str(run_dir)}
+            if "closeout_path" in locals():
+                payload["manager_closeout"] = str(closeout_path)
+            print(json.dumps(payload))
         else:
             print(json.dumps({"status": "escalated", "error": str(error)}))
         return 1

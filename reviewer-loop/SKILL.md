@@ -92,9 +92,20 @@ Use that flag only when you trust the target repo and understand the local execu
 
 Artifacts are written inside the target repo under `.codex/reviewer-loop-runs/<timestamp>/`.
 
+At the end of a completed or escalated run, the controller writes
+`manager-closeout.md` and includes its path in the final JSON payload as
+`manager_closeout`. The manager must read this file before replying to the
+user and explain:
+
+- each issue the loop found;
+- why it was an issue;
+- how the fix addressed it;
+- the test evidence recorded after the fix.
+
 Inspect that directory when:
 
 - a run escalates
 - you want the merged findings payload
 - you want the per-reviewer outputs
 - you want the test logs for a failed fix round
+- you need the manager closeout explanation for the final response

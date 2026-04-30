@@ -880,6 +880,97 @@ def summarize_test_failures(results: list[dict[str, Any]]) -> str:
     return "\n".join(lines).strip()
 
 
+def _record_value(record: Any, key: str, default: Any = None) -> Any:
+    if isinstance(record, dict):
+        return record.get(key, default)
+    return getattr(record, key, default)
+
+
+def _format_location(record: Any) -> str:
+    file_name = _record_value(record, "file", "<unknown file>")
+    line = _record_value(record, "line")
+    return f"{file_name}:{line}" if line is not None else str(file_name)
+
+
+def _format_test_status(result: dict[str, Any]) -> str:
+    status = "passed" if result.get("returncode") == 0 else f"failed ({result.get('returncode')})"
+    return f"{result.get('command', '<unknown command>')}: {status}"
+
+
+def build_manager_closeout(
+    scope: ScopeResolution,
+    *,
+    verdict: str,
+    round_records: list[dict[str, Any]],
+) -> str:
+    lines = [
+        "# Reviewer Loop Manager Closeout",
+        "",
+        f"- Final verdict: `{verdict}`",
+        f"- Scope: {scope.description} (`{scope.effective}`)",
+        f"- Baseline: `{scope.baseline_sha}`",
+        "",
+        "## Issues And Fixes",
+        "",
+    ]
+
+    issue_count = 0
+    for round_record in round_records:
+        findings = list(round_record.get("findings", []))
+        if not findings:
+            continue
+
+        fixes = list(round_record.get("fixes", []))
+        test_results = list(round_record.get("test_results", []))
+        for finding in findings:
+            issue_count += 1
+            title = _record_value(finding, "title", "Untitled finding")
+            severity = _record_value(finding, "severity", "unknown")
+            category = _record_value(finding, "category", "unknown")
+            detail = str(_record_value(finding, "detail", "")).strip()
+
+            lines.extend(
+                [
+                    f"### Round {round_record.get('round')}: {title}",
+                    "",
+                    f"- Location: `{_format_location(finding)}`",
+                    f"- Severity: `{severity}`",
+                    f"- Category: `{category}`",
+                    "",
+                    "Why this was an issue:",
+                    "",
+                    detail or "The reviewers did not provide additional issue detail.",
+                    "",
+                    "How it was fixed:",
+                    "",
+                ]
+            )
+
+            if fixes:
+                for fix_index, fix in enumerate(fixes, start=1):
+                    summary = str(fix.get("summary") or "Fixer returned no summary.").strip()
+                    notes = str(fix.get("notes") or "").strip()
+                    lines.append(f"{fix_index}. {summary}")
+                    if notes:
+                        lines.append(f"   {notes}")
+            else:
+                lines.append("No automated fix was applied for this finding.")
+
+            lines.extend(["", "Test evidence:", ""])
+            if test_results:
+                for result in test_results:
+                    lines.append(f"- {_format_test_status(result)}")
+            else:
+                lines.append("- No post-fix test results were recorded for this round.")
+            lines.append("")
+
+    if issue_count == 0:
+        lines.append("No review issues required fixes.")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
 def run_required_tests(repo: Path, commands: list[str], artifact_dir: Path) -> list[dict[str, Any]]:
     artifact_dir.mkdir(parents=True, exist_ok=True)
     results: list[dict[str, Any]] = []

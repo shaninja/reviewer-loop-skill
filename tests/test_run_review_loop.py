@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -11,8 +12,14 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent.parent / "reviewer-loop" / "scripts"
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from reviewer_loop_lib import LoopError
-from run_review_loop import apply_fixer_edits, ensure_fixer_succeeded, parse_args, positive_int
+from reviewer_loop_lib import LoopError, resolve_scope
+from run_review_loop import (
+    apply_fixer_edits,
+    ensure_fixer_succeeded,
+    parse_args,
+    positive_int,
+    write_manager_closeout,
+)
 
 
 class RunReviewLoopTests(unittest.TestCase):
@@ -107,6 +114,45 @@ class RunReviewLoopTests(unittest.TestCase):
             )
 
         self.assertIn("did not contain the expected text", str(error.exception))
+
+    def test_write_manager_closeout_writes_explanation_file(self) -> None:
+        repo = Path(tempfile.mkdtemp())
+        subprocess.run(["git", "init", str(repo)], check=True, capture_output=True, text=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test User"], check=True)
+        (repo / "app.txt").write_text("one\\n")
+        subprocess.run(["git", "-C", str(repo), "add", "app.txt"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-m", "initial"], check=True, capture_output=True, text=True)
+        run_dir = repo / ".codex" / "reviewer-loop-runs" / "001"
+
+        path = write_manager_closeout(
+            run_dir,
+            resolve_scope(repo, "last-commit"),
+            "approved",
+            [
+                {
+                    "round": 1,
+                    "findings": [
+                        {
+                            "title": "Issue title",
+                            "detail": "Why the issue matters.",
+                            "file": "app.txt",
+                            "line": 1,
+                            "severity": "medium",
+                            "category": "correctness",
+                        }
+                    ],
+                    "fixes": [{"summary": "Fixed it.", "notes": "Adjusted the implementation."}],
+                    "test_results": [{"command": "pytest", "returncode": 0}],
+                }
+            ],
+        )
+
+        self.assertEqual(path, run_dir / "manager-closeout.md")
+        closeout = path.read_text()
+        self.assertIn("Issue title", closeout)
+        self.assertIn("Why this was an issue", closeout)
+        self.assertIn("How it was fixed", closeout)
 
 
 if __name__ == "__main__":
