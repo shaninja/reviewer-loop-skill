@@ -102,6 +102,11 @@ user and explain:
 - how the fix addressed it;
 - the test evidence recorded after the fix.
 
+If the final verdict is `approved_with_notes`, the manager must add TODO
+comments in the target repo code for any unresolved code-specific notes before
+replying to the user. Place each TODO near the affected code and mention the
+TODO path in the final response.
+
 Inspect that directory when:
 
 - a run escalates
